@@ -19,6 +19,10 @@ Differences from the C++ version:
     the remote file is created with mktemp and removed afterwards.
   * Progress, warnings and -v messages go to stderr; stdout carries only
     the results.  The exit status is non-zero if any test fails.
+  * Accounts without a shell, such as rsync.net's, which run only a fixed
+    list of commands, are detected.  They get the C++ version's behavior
+    (login ends when output stops, the terminal driver echoes) and an SFTP
+    speed test, with a warning.
   * "Std-Deviation" replaces "Average-Deviation", which was always the
     sample standard deviation.
 """
@@ -29,6 +33,7 @@ import getpass
 import hashlib
 import logging
 import os
+import secrets
 import shlex
 import socket
 import statistics
@@ -50,6 +55,7 @@ GIGA = 1_000_000_000
 
 ECHO_TIMEOUT = 5.0           # seconds to wait for a single echoed character
 SHELL_TIMEOUT = 30.0         # seconds to wait for the login shell to answer
+LOGIN_QUIET = 1.3            # seconds of quiet that end login without a shell
 SETTLE_MIN = 0.5             # seconds of quiet before the echo test starts
 TRANSFER_TIMEOUT = 60.0      # seconds without progress before a transfer fails
 READY_MARK = b"SSHPING_READY"
@@ -397,38 +403,77 @@ def read_until(chan, marker, timeout):
 
 
 def drain_until_quiet(chan, quiet, max_wait):
-    """Discard output until none arrives for `quiet` seconds."""
+    """Discard output until none arrives for `quiet` seconds.  Returns the
+    time the last output arrived, or None if there was none.  Raises
+    EOFError if the channel closes."""
     deadline = time.monotonic() + max_wait
+    last = None
     chan.settimeout(quiet)
     while True:
         try:
             data = chan.recv(4096)
         except socket.timeout:
-            return
+            return last
         if not data:
-            raise SSHPingError("Remote shell exited during echo setup")
+            raise EOFError()
+        last = now()
         if time.monotonic() > deadline:
-            raise SSHPingError("Echo command keeps producing output; "
+            raise SSHPingError("Remote session keeps producing output; "
                                "cannot start the echo test")
 
 
-def open_login_shell(transport):
-    """Start an interactive shell on a pty and wait until it answers."""
+def has_posix_shell(transport):
+    """Whether the account's commands run under a real shell.  Restricted
+    accounts, such as rsync.net's, run a fixed list of commands without one.
+    Only a shell removes the empty quotes."""
+    try:
+        status, out, _ = remote_run(transport, 'echo SSHPING_""READY',
+                                    timeout=SHELL_TIMEOUT)
+    except (paramiko.SSHException, OSError, SSHPingError) as e:
+        verbose(f"  * Shell check failed: {e}")
+        return False
+    return status == 0 and READY_MARK.decode() in out
+
+
+def open_pty_session(transport):
     chan = transport.open_session()
     chan.get_pty(term="xterm", width=80, height=24)
     chan.invoke_shell()
+    return chan
+
+
+def open_login_shell(transport):
+    """Start an interactive shell on a pty and wait until it answers.
+    Returns the channel, or None if the shell did not answer in time."""
+    chan = open_pty_session(transport)
     # The empty quotes keep the terminal's echo of this line from matching.
     # Commands start with a space to keep them out of the shell history.
     chan.sendall(b' echo SSHPING_""READY\n')
     try:
         read_until(chan, READY_MARK, SHELL_TIMEOUT)
     except socket.timeout:
-        raise SSHPingError("Login shell did not answer within "
-                           f"{SHELL_TIMEOUT:.0f} s", EXIT_CONNECT_FAILED)
+        chan.close()
+        return None
     except EOFError:
         raise SSHPingError("Login shell exited", EXIT_CONNECT_FAILED)
     verbose("+++ Login shell established")
     return chan
+
+
+def open_shellless_session(transport):
+    """For accounts without a usable shell, do what the C++ sshping does:
+    open a pty session and wait for login output to stop.  Returns the
+    channel and the time the session was ready (when its last output
+    arrived)."""
+    chan = open_pty_session(transport)
+    ready = now()
+    try:
+        last = drain_until_quiet(chan, LOGIN_QUIET, max_wait=SHELL_TIMEOUT)
+    except EOFError:
+        raise SSHPingError("Remote host closed the terminal session",
+                           EXIT_CONNECT_FAILED)
+    verbose("+++ Terminal session established (no shell)")
+    return chan, last or ready
 
 
 class Progress:
@@ -457,10 +502,10 @@ class Progress:
             print("\r" + " " * 40 + "\r", end="", file=sys.stderr, flush=True)
 
 
-def run_echo_test(chan, echo_cmd, count, time_limit, reporter, ping_summary):
-    # Start the echo responder.  Its command line comes straight back from
-    # the terminal driver, which gives a rough round-trip time; then wait for
-    # output to stop so the responder is running before timing starts.
+def start_echo_responder(chan, echo_cmd):
+    # The command line comes straight back from the terminal driver, which
+    # gives a rough round-trip time; then wait for output to stop so the
+    # responder is running before timing starts.
     t = now()
     chan.sendall((" " + echo_cmd + "\n").encode())
     chan.settimeout(ECHO_TIMEOUT)
@@ -470,14 +515,25 @@ def run_echo_test(chan, echo_cmd, count, time_limit, reporter, ping_summary):
     except socket.timeout:
         raise SSHPingError("No response from remote shell")
     rtt = (now() - t) / GIGA
-    drain_until_quiet(chan, quiet=max(SETTLE_MIN, 4 * rtt), max_wait=15)
+    try:
+        drain_until_quiet(chan, quiet=max(SETTLE_MIN, 4 * rtt), max_wait=15)
+    except EOFError:
+        raise SSHPingError("Remote shell exited during echo setup")
     verbose(f"+++ Echo responder started: {echo_cmd}")
+
+
+def run_echo_test(chan, echo_cmd, count, time_limit, reporter, ping_summary):
+    """Time single-character echoes.  With echo_cmd None there is no shell
+    to run a responder, and the remote terminal driver does the echoing."""
+    if echo_cmd is not None:
+        start_echo_responder(chan, echo_cmd)
 
     chars = string.ascii_letters.encode()
     latencies = []
     progress = Progress(count, reporter)
     deadline = now() + time_limit * GIGA if time_limit else None
     chan.settimeout(ECHO_TIMEOUT)
+    error = None
     try:
         while ((not count or len(latencies) < count)
                and (deadline is None or now() < deadline)):
@@ -488,17 +544,25 @@ def run_echo_test(chan, echo_cmd, count, time_limit, reporter, ping_summary):
             r = chan.recv(1)
             tr = now()
             if r != c:
-                if not r:
-                    raise SSHPingError("Remote echo command exited")
-                raise SSHPingError(f"Echo failed, sent {c!r} yet got {r!r}")
+                error = (f"echo failed, sent {c!r} yet got {r!r}" if r
+                         else "the remote session closed")
+                break
             latencies.append(tr - tw)
             progress.update(n + 1, tr - tw)
     except socket.timeout:
-        raise SSHPingError(f"No echo within {ECHO_TIMEOUT:.0f} s after "
-                           f"{len(latencies)} characters")
+        error = f"no echo within {ECHO_TIMEOUT:.0f} s"
     finally:
         progress.done()
         chan.close()  # hangs up the remote session, ending the responder
+    if error:
+        if echo_cmd is not None or not latencies:
+            raise SSHPingError(f"{error[0].upper()}{error[1:]} after "
+                               f"{len(latencies)} characters")
+        # Without a shell, nothing reads what we type, so the remote
+        # terminal's input buffer can fill up and stop echoing
+        warn(f"echo stopped after {len(latencies)} characters: {error}.  "
+             "The remote terminal's input buffer is probably full; use -c "
+             "to send fewer characters")
     verbose("+++ Echo test finished")
 
     if len(latencies) < 13:
@@ -550,6 +614,12 @@ def make_payload():
     return os.urandom(MEGA).translate(table)
 
 
+def report_transfer(reporter, direction, nbytes, elapsed_ns):
+    reporter.line(f"{direction}-Size", nbytes, 0, "B")
+    reporter.line(f"{direction}-Rate", nbytes * GIGA / max(elapsed_ns, 1),
+                  0, "B/s")
+
+
 def run_upload_test(transport, remfile, size_mb, reporter):
     verbose(f"+++ Upload test started, remote file is {remfile}")
     payload = make_payload()
@@ -574,9 +644,7 @@ def run_upload_test(transport, remfile, size_mb, reporter):
         raise SSHPingError(f"Upload failed (exit status {status}): "
                            f"{remote_error(chan)}")
     chan.close()
-    reporter.line("Upload-Size", size_mb * MEGA, 0, "B")
-    reporter.line("Upload-Rate", size_mb * MEGA * GIGA / max(t3 - t2, 1),
-                  0, "B/s")
+    report_transfer(reporter, "Upload", size_mb * MEGA, t3 - t2)
     verbose("+++ Upload test completed")
 
 
@@ -605,9 +673,7 @@ def run_download_test(transport, remfile, size_mb, reporter):
     if received != expected:
         raise SSHPingError(f"Download got {received} bytes, "
                            f"expected {expected}")
-    reporter.line("Download-Size", received, 0, "B")
-    reporter.line("Download-Rate", received * GIGA / max(t3 - t2, 1),
-                  0, "B/s")
+    report_transfer(reporter, "Download", received, t3 - t2)
     verbose("+++ Download test completed")
 
 
@@ -624,6 +690,71 @@ def prepare_remote_file(transport, path):
         return out.strip(), True
     status, _, _ = remote_run(transport, f"test -e {shlex.quote(path)}")
     return path, status != 0
+
+
+def run_sftp_speed_tests(transport, remfile, size_mb, reporter):
+    """Speed test over SFTP, for accounts that cannot run cat > FILE or
+    mktemp.  Without -z the file gets a random name in the SFTP starting
+    directory (normally home); with -z it is removed afterwards only if it
+    did not exist before."""
+    try:
+        sftp = paramiko.SFTPClient.from_transport(transport)
+    except (paramiko.SSHException, OSError) as e:
+        raise SSHPingError(f"Cannot start SFTP for the speed test: {e}")
+    sftp.get_channel().settimeout(TRANSFER_TIMEOUT)
+    if remfile is None:
+        remfile, remove = f"sshping-{secrets.token_hex(8)}.tmp", True
+    else:
+        try:
+            sftp.stat(remfile)
+            remove = False
+        except FileNotFoundError:
+            remove = True
+        except (OSError, paramiko.SSHException) as e:
+            sftp.close()
+            raise SSHPingError(f"Cannot check remote file {remfile}: {e}")
+    expected = size_mb * MEGA
+    try:
+        verbose(f"+++ SFTP upload test started, remote file is {remfile}")
+        payload = make_payload()
+        try:
+            t2 = now()
+            with sftp.open(remfile, "wb") as f:
+                f.set_pipelined(True)
+                for _ in range(size_mb):
+                    f.write(payload)
+            t3 = now()  # closing waits until every write is acknowledged
+        except (OSError, paramiko.SSHException) as e:
+            raise SSHPingError(f"SFTP upload to {remfile} failed: {e}")
+        report_transfer(reporter, "Upload", expected, t3 - t2)
+
+        verbose("+++ SFTP download test started")
+        received = 0
+        try:
+            t2 = now()
+            with sftp.open(remfile, "rb") as f:
+                f.prefetch(expected)
+                while True:
+                    data = f.read(1 << 20)
+                    if not data:
+                        break
+                    received += len(data)
+            t3 = now()
+        except (OSError, paramiko.SSHException) as e:
+            raise SSHPingError(f"SFTP download of {remfile} failed after "
+                               f"{received} bytes: {e}")
+        if received != expected:
+            raise SSHPingError(f"Download got {received} bytes, "
+                               f"expected {expected}")
+        report_transfer(reporter, "Download", received, t3 - t2)
+        verbose("+++ SFTP speed test completed")
+    finally:
+        if remove:
+            try:
+                sftp.remove(remfile)
+            except (OSError, paramiko.SSHException):
+                warn(f"could not remove remote file {remfile}")
+        sftp.close()
 
 
 def run_speed_tests(transport, remfile, size_mb, reporter):
@@ -686,10 +817,11 @@ def parse_args(argv):
                         f"{DEFAULT_COUNT}")
     p.add_argument("-d", "--delimited", action="store_true",
                    help="use delimiters in big numbers, eg 1,234,567")
-    p.add_argument("-e", "--echocmd", metavar="CMD", default=DEFAULT_ECHO_CMD,
+    p.add_argument("-e", "--echocmd", metavar="CMD",
                    help=f"remote echo command, default: {DEFAULT_ECHO_CMD}; "
                         "use 'cat > /dev/null' to have the remote terminal "
-                        "driver echo instead of a process")
+                        "driver echo instead of a process.  Ignored on hosts "
+                        "without a shell, where the terminal driver echoes")
     p.add_argument("-F", "--config-file", metavar="FILE",
                    help="read ssh options from FILE, default ~/.ssh/config")
     p.add_argument("-H", "--human-readable", action="store_true",
@@ -722,7 +854,9 @@ def parse_args(argv):
                         "-vvv adds ssh protocol debugging")
     p.add_argument("-z", "--remote", metavar="FILE",
                    help="remote file for up/download tests; default is a "
-                        "new mktemp file in /tmp, removed afterwards")
+                        "new mktemp file in /tmp (on hosts without a shell, "
+                        "a randomly named file in the SFTP home directory), "
+                        "removed afterwards")
     args = p.parse_args(argv)
     if args.count is None and args.time is None:
         args.count = DEFAULT_COUNT
@@ -749,8 +883,9 @@ def run(args):
     timeout = args.connect_time or None
     reporter = Reporter(args.human_readable, args.delimited)
 
+    echo_cmd = args.echocmd or DEFAULT_ECHO_CMD
     verbose(f"User: {user}\nHost: {hostname}\nPort: {port}\n"
-            f"Echo: {args.echocmd}\n Cfg: {args.config_file or '--default--'}"
+            f"Echo: {echo_cmd}\n Cfg: {args.config_file or '--default--'}"
             "\n")
     verbose(f"+++ Attempting connection to {hostname}:{port} as user "
             f"'{user}'")
@@ -769,21 +904,45 @@ def run(args):
             check_host_key(transport, hostname, port, args.strict_host_key)
             authenticate(transport, user, hostname, args.password, identities,
                          clock)
-            chan = open_login_shell(transport)
+            # Checking for a shell and waiting for a shell that never
+            # answers don't count toward the login time
+            t = now()
+            shell = has_posix_shell(transport)
+            clock.excluded_ns += now() - t
+            t = now()
+            chan = open_login_shell(transport) if shell else None
+            t1 = now()
+            if chan is None:
+                clock.excluded_ns += t1 - t
+                notes = ["login time ends when login output stops"]
+                if "e" in args.runtests:
+                    notes.append("the remote terminal driver echoes"
+                                 + (" (-e ignored)" if args.echocmd else ""))
+                if "s" in args.runtests and not shell:
+                    notes.append("the speed test uses SFTP")
+                reason = (f"login shell did not answer within "
+                          f"{SHELL_TIMEOUT:.0f} s" if shell else
+                          "remote account has no shell (restricted, like "
+                          "rsync.net?)")
+                warn(f"{reason}: {', '.join(notes)}")
+                chan, t1 = open_shellless_session(transport)
+                echo_cmd = None
         except (paramiko.SSHException, OSError, EOFError) as e:
             raise SSHPingError(f"ssh connection failed: {e}",
                                EXIT_CONNECT_FAILED)
-        t1 = now()
         reporter.line("ssh-Login-Time", t1 - t0 - clock.excluded_ns, -9, "s")
 
         try:
             if "e" in args.runtests:
-                run_echo_test(chan, args.echocmd, args.count, args.time,
+                run_echo_test(chan, echo_cmd, args.count, args.time,
                               reporter, args.ping_summary)
             else:
                 chan.close()
-            if "s" in args.runtests:
+            if "s" in args.runtests and shell:
                 run_speed_tests(transport, args.remote, args.size, reporter)
+            elif "s" in args.runtests:
+                run_sftp_speed_tests(transport, args.remote, args.size,
+                                     reporter)
         except (paramiko.SSHException, OSError) as e:
             raise SSHPingError(f"Test failed: {e}")
     finally:

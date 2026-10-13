@@ -35,6 +35,29 @@ Results go to stdout as `Label: value unit` lines. Progress, warnings and
 `-v` messages go to stderr. The exit status is 0 on success, 1 if a test
 failed, 2 for usage errors and 255 if the connection or login failed.
 
+## Accounts without a shell
+
+Some hosts, such as rsync.net, give an account no shell: it may run only
+single commands from a fixed list, plus scp, SFTP and rsync. sshping checks
+for this by running `echo SSHPING_""READY`, since only a real shell removes
+the quotes. Without a shell it prints a warning and works like the C++
+version:
+
+- `ssh-Login-Time` ends when the terminal session's login output stops,
+  rather than when a shell answers.
+- The echo test sends characters to a terminal session where nothing reads
+  them, so the remote terminal driver echoes them. `-e` is ignored. If the
+  terminal's input buffer fills, the test stops early with a warning and
+  reports what it measured; use `-c` to send fewer characters.
+- The speed test uses SFTP, with a randomly named file in the SFTP home
+  directory, removed afterwards. A `-z FILE` is removed only if it did not
+  exist before. paramiko's SFTP downloads
+  more slowly than the `cat` stream used on normal hosts, so compare speed
+  results only between hosts tested the same way.
+
+The same fallback applies on a normal host whose interactive login never
+answers within 30 s, but there the speed test still uses `cat`.
+
 ## Differences from the C++ version
 
 - Process echo is the default (see above).
@@ -66,4 +89,9 @@ measure paramiko rather than the network.
 
 ## Tests
 
-    python3 -m unittest -v test_sshping
+    python3 -m unittest -v
+
+`test_sshping.py` covers formatting, statistics and option parsing.
+`test_restricted_server.py` runs sshping end to end against fake ssh
+servers built with paramiko, including one that behaves like a restricted
+account (no shell, fixed command list, SFTP).

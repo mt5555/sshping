@@ -87,7 +87,7 @@ class TestArgs(unittest.TestCase):
     def test_defaults(self):
         a = sshping.parse_args(["host"])
         self.assertEqual(a.count, sshping.DEFAULT_COUNT)
-        self.assertEqual(a.echocmd, "stty raw -echo; cat")
+        self.assertIsNone(a.echocmd)  # resolved once we know there is a shell
         self.assertEqual(a.runtests, "es")
 
     def test_time_limit_alone_means_no_count_limit(self):
