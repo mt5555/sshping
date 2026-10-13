@@ -15,14 +15,16 @@ Differences from the C++ version:
   * The server's host key is checked against known_hosts.  A changed key is
     an error; an unknown key is a warning (an error with --strict-host-key).
   * The speed test streams the data over a single ssh channel each way
-    (cat > FILE, then cat FILE) instead of repeated 1 MB scp transfers, and
-    the remote file is created with mktemp and removed afterwards.
+    (dd of=FILE, then cat FILE) instead of repeated 1 MB scp transfers.
+    The remote file gets a random name, in /tmp if it is writable, else in
+    the home directory, and is removed afterwards.  These commands need no
+    shell, so the speed test also works on restricted accounts.
   * Progress, warnings and -v messages go to stderr; stdout carries only
     the results.  The exit status is non-zero if any test fails.
   * Accounts without a shell, such as rsync.net's, which run only a fixed
     list of commands, are detected.  They get the C++ version's behavior
-    (login ends when output stops, the terminal driver echoes) and an SFTP
-    speed test, with a warning.
+    (login ends when output stops, the terminal driver echoes), with a
+    warning.
   * "Std-Deviation" replaces "Average-Deviation", which was always the
     sample standard deviation.
 """
@@ -422,17 +424,24 @@ def drain_until_quiet(chan, quiet, max_wait):
                                "cannot start the echo test")
 
 
-def has_posix_shell(transport):
-    """Whether the account's commands run under a real shell.  Restricted
-    accounts, such as rsync.net's, run a fixed list of commands without one.
-    Only a shell removes the empty quotes."""
+# Every Unix host has sh, whatever the login shell, and only a real shell
+# does arithmetic.  Restricted accounts run a fixed list of commands, which
+# never includes sh; rsync.net's even removes quotes and obeys ';' like a
+# shell, so those prove nothing.
+SHELL_CHECK = "sh -c 'echo SSHPING_$((6*7))'"
+SHELL_CHECK_OUTPUT = "SSHPING_42"
+
+
+def has_shell(transport):
+    """Whether the account can run a real shell, which the echo test's
+    responder needs."""
     try:
-        status, out, _ = remote_run(transport, 'echo SSHPING_""READY',
+        status, out, _ = remote_run(transport, SHELL_CHECK,
                                     timeout=SHELL_TIMEOUT)
     except (paramiko.SSHException, OSError, SSHPingError) as e:
         verbose(f"  * Shell check failed: {e}")
         return False
-    return status == 0 and READY_MARK.decode() in out
+    return status == 0 and SHELL_CHECK_OUTPUT in out.split()
 
 
 def open_pty_session(transport):
@@ -625,7 +634,8 @@ def run_upload_test(transport, remfile, size_mb, reporter):
     payload = make_payload()
     chan = transport.open_session()
     chan.settimeout(TRANSFER_TIMEOUT)
-    chan.exec_command(f"cat > {shlex.quote(remfile)}")
+    # dd rather than "cat > FILE", which needs a shell for the redirection
+    chan.exec_command(f"dd of={shlex.quote(remfile)} bs={MEGA}")
     t2 = now()
     try:
         for _ in range(size_mb):
@@ -678,83 +688,16 @@ def run_download_test(transport, remfile, size_mb, reporter):
 
 
 def prepare_remote_file(transport, path):
-    """Return (path, remove_afterwards).  Without -z, create a private
-    temporary file with mktemp; with -z, remove the file afterwards only if
-    it did not exist before."""
+    """Return (path, remove_afterwards).  Without -z, pick a random name in
+    /tmp if it is writable, else in the home directory (mktemp is not
+    available on restricted accounts); with -z, remove the file afterwards
+    only if it did not exist before."""
     if path is None:
-        status, out, err = remote_run(transport,
-                                      "mktemp /tmp/sshping-XXXXXXXX")
-        if status != 0 or not out.strip():
-            raise SSHPingError(f"Cannot create remote temp file: "
-                               f"{err.strip() or 'mktemp failed'}")
-        return out.strip(), True
+        status, _, _ = remote_run(transport, "test -w /tmp")
+        directory = "/tmp/" if status == 0 else ""
+        return f"{directory}sshping-{secrets.token_hex(8)}.tmp", True
     status, _, _ = remote_run(transport, f"test -e {shlex.quote(path)}")
     return path, status != 0
-
-
-def run_sftp_speed_tests(transport, remfile, size_mb, reporter):
-    """Speed test over SFTP, for accounts that cannot run cat > FILE or
-    mktemp.  Without -z the file gets a random name in the SFTP starting
-    directory (normally home); with -z it is removed afterwards only if it
-    did not exist before."""
-    try:
-        sftp = paramiko.SFTPClient.from_transport(transport)
-    except (paramiko.SSHException, OSError) as e:
-        raise SSHPingError(f"Cannot start SFTP for the speed test: {e}")
-    sftp.get_channel().settimeout(TRANSFER_TIMEOUT)
-    if remfile is None:
-        remfile, remove = f"sshping-{secrets.token_hex(8)}.tmp", True
-    else:
-        try:
-            sftp.stat(remfile)
-            remove = False
-        except FileNotFoundError:
-            remove = True
-        except (OSError, paramiko.SSHException) as e:
-            sftp.close()
-            raise SSHPingError(f"Cannot check remote file {remfile}: {e}")
-    expected = size_mb * MEGA
-    try:
-        verbose(f"+++ SFTP upload test started, remote file is {remfile}")
-        payload = make_payload()
-        try:
-            t2 = now()
-            with sftp.open(remfile, "wb") as f:
-                f.set_pipelined(True)
-                for _ in range(size_mb):
-                    f.write(payload)
-            t3 = now()  # closing waits until every write is acknowledged
-        except (OSError, paramiko.SSHException) as e:
-            raise SSHPingError(f"SFTP upload to {remfile} failed: {e}")
-        report_transfer(reporter, "Upload", expected, t3 - t2)
-
-        verbose("+++ SFTP download test started")
-        received = 0
-        try:
-            t2 = now()
-            with sftp.open(remfile, "rb") as f:
-                f.prefetch(expected)
-                while True:
-                    data = f.read(1 << 20)
-                    if not data:
-                        break
-                    received += len(data)
-            t3 = now()
-        except (OSError, paramiko.SSHException) as e:
-            raise SSHPingError(f"SFTP download of {remfile} failed after "
-                               f"{received} bytes: {e}")
-        if received != expected:
-            raise SSHPingError(f"Download got {received} bytes, "
-                               f"expected {expected}")
-        report_transfer(reporter, "Download", received, t3 - t2)
-        verbose("+++ SFTP speed test completed")
-    finally:
-        if remove:
-            try:
-                sftp.remove(remfile)
-            except (OSError, paramiko.SSHException):
-                warn(f"could not remove remote file {remfile}")
-        sftp.close()
 
 
 def run_speed_tests(transport, remfile, size_mb, reporter):
@@ -854,9 +797,8 @@ def parse_args(argv):
                         "-vvv adds ssh protocol debugging")
     p.add_argument("-z", "--remote", metavar="FILE",
                    help="remote file for up/download tests; default is a "
-                        "new mktemp file in /tmp (on hosts without a shell, "
-                        "a randomly named file in the SFTP home directory), "
-                        "removed afterwards")
+                        "randomly named file in /tmp (or the home directory "
+                        "if /tmp is not writable), removed afterwards")
     args = p.parse_args(argv)
     if args.count is None and args.time is None:
         args.count = DEFAULT_COUNT
@@ -907,7 +849,7 @@ def run(args):
             # Checking for a shell and waiting for a shell that never
             # answers don't count toward the login time
             t = now()
-            shell = has_posix_shell(transport)
+            shell = has_shell(transport)
             clock.excluded_ns += now() - t
             t = now()
             chan = open_login_shell(transport) if shell else None
@@ -918,8 +860,6 @@ def run(args):
                 if "e" in args.runtests:
                     notes.append("the remote terminal driver echoes"
                                  + (" (-e ignored)" if args.echocmd else ""))
-                if "s" in args.runtests and not shell:
-                    notes.append("the speed test uses SFTP")
                 reason = (f"login shell did not answer within "
                           f"{SHELL_TIMEOUT:.0f} s" if shell else
                           "remote account has no shell (restricted, like "
@@ -938,11 +878,8 @@ def run(args):
                               reporter, args.ping_summary)
             else:
                 chan.close()
-            if "s" in args.runtests and shell:
+            if "s" in args.runtests:
                 run_speed_tests(transport, args.remote, args.size, reporter)
-            elif "s" in args.runtests:
-                run_sftp_speed_tests(transport, args.remote, args.size,
-                                     reporter)
         except (paramiko.SSHException, OSError) as e:
             raise SSHPingError(f"Test failed: {e}")
     finally:

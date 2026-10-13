@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """End-to-end tests of sshping.py against fake ssh servers built with
 paramiko, mainly one that behaves like a restricted account such as
-rsync.net's: no shell, a fixed list of commands run without shell syntax,
-and SFTP."""
+rsync.net's.
+
+What the fake copies from rsync.net, as observed with a real account:
+there is no interactive shell, but a terminal session can be opened and its
+terminal driver echoes.  Commands come from a fixed list (no sh, stty or
+mktemp).  The command handler removes quotes and runs commands separated by
+';' like a shell does.  /tmp exists, and "dd of=FILE" and "cat FILE" work.
+"""
 
 import contextlib
 import io
 import os
+import re
 import shlex
 import socket
 import sys
@@ -30,63 +37,41 @@ def setUpModule():
     HOST_KEY = paramiko.RSAKey.generate(2048)
 
 
-class FakeSFTP(paramiko.SFTPServerInterface):
-    """SFTP rooted at the fake server's home directory."""
+def split_commands(command):
+    """Split a command line the way rsync.net's handler appears to: words
+    with quotes removed, and ';' separating commands.  No other shell
+    syntax: no redirection, variables or arithmetic."""
+    lex = shlex.shlex(command, posix=True, punctuation_chars=";")
+    lex.whitespace_split = True
+    commands = [[]]
+    for word in lex:
+        if word == ";":
+            commands.append([])
+        else:
+            commands[-1].append(word)
+    return [c for c in commands if c]
 
-    def __init__(self, server, *args, **kwargs):
-        super().__init__(server, *args, **kwargs)
-        self.root = server.home
 
-    def _path(self, path):
-        return os.path.join(self.root,
-                            os.path.normpath("/" + path).lstrip("/"))
-
-    def stat(self, path):
-        try:
-            return paramiko.SFTPAttributes.from_stat(os.stat(self._path(path)))
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-
-    lstat = stat
-
-    def open(self, path, flags, attr):
-        try:
-            fd = os.open(self._path(path), flags, 0o600)
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-        writable = flags & (os.O_WRONLY | os.O_RDWR)
-        f = os.fdopen(fd, "r+b" if flags & os.O_RDWR else
-                      "wb" if writable else "rb")
-        handle = paramiko.SFTPHandle(flags)
-        if writable:
-            handle.writefile = f
-        if not flags & os.O_WRONLY:
-            handle.readfile = f
-        return handle
-
-    def remove(self, path):
-        try:
-            os.remove(self._path(path))
-        except OSError as e:
-            return paramiko.SFTPServer.convert_errno(e.errno)
-        return paramiko.SFTP_OK
+class CommandFailed(Exception):
+    pass
 
 
 class RestrictedServer(paramiko.ServerInterface):
-    """An rsync.net-style account.  A shell request gets a terminal that
-    nothing reads, so only the terminal driver's echo comes back.  Commands
-    are split into words with no shell parsing, and only a fixed list is
-    allowed (of which this fake implements just echo)."""
+    """An rsync.net-style account.  The filesystem lives in `root`; the home
+    directory is root/home, and /tmp exists only if root/tmp does."""
 
-    ALLOWED = {"cat", "dd", "echo", "test", "ls", "rm", "mkdir", "touch",
-               "stat", "df"}
-    shell_quotes = False
+    ALLOWED = {"cat", "dd", "echo", "test", "tree", "tail", "cp", "ls",
+               "mkdir", "pwd", "chmod", "ln", "mv", "rm", "rmdir", "touch",
+               "find", "df", "date", "stat", "cksum"}
+    has_shell = False
 
-    def __init__(self, home, echo_limit=None):
-        self.home = home
+    def __init__(self, root, echo_limit=None):
+        self.root = root
         self.echo_limit = echo_limit
         self.exec_commands = []
-        self.exec_output = []  # words of each command, after it finished
+        os.makedirs(os.path.join(root, "home"), exist_ok=True)
+
+    # --- authentication and channels
 
     def get_allowed_auths(self, username):
         return "password"
@@ -105,6 +90,8 @@ class RestrictedServer(paramiko.ServerInterface):
         return True
 
     def check_channel_shell_request(self, channel):
+        # No interactive shell: nothing reads the terminal, so only its
+        # driver's echo comes back
         threading.Thread(target=self._terminal_echo, args=(channel,),
                          daemon=True).start()
         return True
@@ -124,42 +111,121 @@ class RestrictedServer(paramiko.ServerInterface):
     def check_channel_exec_request(self, channel, command):
         command = command.decode()
         self.exec_commands.append(command)
-        threading.Thread(target=self._run, args=(channel, command),
+        threading.Thread(target=self._exec, args=(channel, command),
                          daemon=True).start()
         return True
 
-    def _run(self, chan, command):
-        words = shlex.split(command) if self.shell_quotes else command.split()
-        name = words[0] if words else ""
-        if name == "echo":
-            chan.sendall((" ".join(words[1:]) + "\n").encode())
-            status = 0
-        elif name in self.ALLOWED:
-            chan.sendall_stderr(f"fake server: {name} not implemented\n"
-                                .encode())
-            status = 1
-        else:
-            chan.sendall_stderr(f"Command not allowed: {name}\n".encode())
+    def _exec(self, chan, command):
+        status = 0
+        try:
+            for words in split_commands(command):
+                status = self._run(chan, words)
+        except CommandFailed as e:
+            chan.sendall_stderr(f"{e}\n".encode())
             status = 1
         chan.send_exit_status(status)
         # End with EOF rather than close(): closing can beat paramiko's
         # reply to the exec request, which the client sees as a failure
         chan.shutdown_write()
-        self.exec_output.append(words)
+
+    # --- commands
+
+    def _path(self, path):
+        if not path.startswith("/"):
+            path = "/home/" + path
+        return os.path.join(self.root, os.path.normpath(path).lstrip("/"))
+
+    def _stdin(self, chan):
+        data = b""
+        while True:
+            chunk = chan.recv(65536)
+            if not chunk:
+                return data
+            data += chunk
+
+    def _run(self, chan, words):
+        name, args = words[0], words[1:]
+        if name == "sh" and self.has_shell:
+            return self._sh(chan, args)
+        if name not in self.ALLOWED:
+            raise CommandFailed(f"Command not allowed: {name}")
+        method = getattr(self, f"_cmd_{name}", None)
+        if method is None:
+            raise CommandFailed(f"fake server: {name} not implemented")
+        return method(chan, args)
+
+    def _cmd_echo(self, chan, args):
+        chan.sendall((" ".join(args) + "\n").encode())
+        return 0
+
+    def _cmd_test(self, chan, args):
+        if len(args) != 2:
+            raise CommandFailed("fake server: test supports -e, -d, -w FILE")
+        op, path = args[0], self._path(args[1])
+        result = {"-e": os.path.exists, "-d": os.path.isdir,
+                  "-w": lambda p: os.access(p, os.W_OK)}[op](path)
+        return 0 if result else 1
+
+    def _cmd_dd(self, chan, args):
+        ops = dict(a.split("=", 1) for a in args)
+        try:
+            if "if" in ops:
+                with open(self._path(ops["if"]), "rb") as f:
+                    data = f.read()
+            else:
+                data = self._stdin(chan)
+            if "of" in ops:
+                with open(self._path(ops["of"]), "wb") as f:
+                    f.write(data)
+            else:
+                chan.sendall(data)
+        except OSError as e:
+            raise CommandFailed(f"dd: {e.strerror}")
+        chan.sendall_stderr(f"{len(data)} bytes transferred\n".encode())
+        return 0
+
+    def _cmd_cat(self, chan, args):
+        for path in args:
+            try:
+                with open(self._path(path), "rb") as f:
+                    chan.sendall(f.read())
+            except OSError as e:
+                raise CommandFailed(f"cat: {path}: {e.strerror}")
+        return 0
+
+    def _cmd_rm(self, chan, args):
+        force = "-f" in args
+        for path in (a for a in args if not a.startswith("-")):
+            try:
+                os.remove(self._path(path))
+            except FileNotFoundError:
+                if not force:
+                    raise CommandFailed(f"rm: {path}: No such file")
+        return 0
+
+    def _sh(self, chan, args):
+        """Just enough of sh -c for the tests: arithmetic expansion."""
+        if args[:1] != ["-c"] or len(args) != 2:
+            raise CommandFailed("fake server: only sh -c SCRIPT")
+        script = re.sub(r"\$\(\((\d+)\*(\d+)\)\)",
+                        lambda m: str(int(m[1]) * int(m[2])), args[1])
+        status = 0
+        for words in split_commands(script):
+            status = self._run(chan, words)
+        return status
 
 
 class ShellWithoutTerminalServer(RestrictedServer):
-    """Commands run under a real shell, but an interactive login never
+    """Commands can run a real shell, but an interactive login never
     answers (a menu, or a login that hangs)."""
-    shell_quotes = True
+    has_shell = True
 
 
 class FakeSSHServer:
     """Accepts ssh connections on localhost in a background thread."""
 
-    def __init__(self, server, sftp=True):
+    def __init__(self, server):
         self.server = server
-        self.sftp = sftp
         self.transports = []
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
@@ -175,8 +241,6 @@ class FakeSSHServer:
                 return
             t = paramiko.Transport(client)
             t.add_server_key(HOST_KEY)
-            if self.sftp:
-                t.set_subsystem_handler("sftp", paramiko.SFTPServer, FakeSFTP)
             self.transports.append(t)
             try:
                 t.start_server(server=self.server)
@@ -189,15 +253,15 @@ class FakeSSHServer:
             t.close()
 
 
-class ShelllessTestCase(unittest.TestCase):
+class FakeServerTestCase(unittest.TestCase):
     server_class = RestrictedServer
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.home = os.path.join(tmp.name, "remote")
+        self.root = os.path.join(tmp.name, "remote")
         self.local_home = os.path.join(tmp.name, "local")
-        os.mkdir(self.home)
+        os.makedirs(os.path.join(self.root, "tmp"))
         os.mkdir(self.local_home)
         # Keep the waits short so the tests run quickly
         for name, value in (("LOGIN_QUIET", 0.2), ("ECHO_TIMEOUT", 0.5),
@@ -206,12 +270,16 @@ class ShelllessTestCase(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def start_server(self, sftp=True, **kwargs):
-        self.server = self.server_class(self.home, **kwargs)
-        self.ssh = FakeSSHServer(self.server, sftp=sftp)
+    def start_server(self, **kwargs):
+        self.server = self.server_class(self.root, **kwargs)
+        self.ssh = FakeSSHServer(self.server)
         self.addCleanup(self.ssh.close)
 
-    def run_sshping(self, *args):
+    def remote_files(self):
+        return sorted(os.path.relpath(os.path.join(d, f), self.root)
+                      for d, _, files in os.walk(self.root) for f in files)
+
+    def run_sshping(self, *args, password=PASSWORD):
         """Run sshping in-process with no local keys, agent or ssh config.
         Returns (exit status, {label: value} from stdout, stderr)."""
         out, err = io.StringIO(), io.StringIO()
@@ -219,7 +287,7 @@ class ShelllessTestCase(unittest.TestCase):
         with mock.patch.dict(os.environ, env), \
                 contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err):
-            status = sshping.main([*args, "-p", PASSWORD,
+            status = sshping.main([*args, "-p", password,
                                    f"{USER}@127.0.0.1:{self.ssh.port}"])
         results = {}
         for line in out.getvalue().splitlines():
@@ -229,7 +297,39 @@ class ShelllessTestCase(unittest.TestCase):
         return status, results, err.getvalue()
 
 
-class TestRestrictedAccount(ShelllessTestCase):
+class TestFakeServer(FakeServerTestCase):
+    """The fake restricted server must behave like the real rsync.net,
+    or the other tests prove nothing."""
+
+    def connect(self):
+        sock = socket.create_connection(("127.0.0.1", self.ssh.port))
+        transport = paramiko.Transport(sock)
+        self.addCleanup(transport.close)
+        transport.start_client()
+        transport.auth_password(USER, PASSWORD)
+        return transport
+
+    def test_behaves_like_rsync_net(self):
+        self.start_server()
+        t = self.connect()
+        self.assertEqual(sshping.remote_run(t, 'echo SSHPING_""READY')[:2],
+                         (0, "SSHPING_READY\n"))
+        self.assertEqual(sshping.remote_run(t, "echo SSHPING; echo READY")
+                         [:2], (0, "SSHPING\nREADY\n"))
+        for command in (sshping.SHELL_CHECK, "stty -a", "mktemp"):
+            status, _, err = sshping.remote_run(t, command)
+            self.assertEqual(status, 1, command)
+            self.assertIn("not allowed", err)
+        self.assertEqual(sshping.remote_run(t, "test -w /tmp")[0], 0)
+        self.assertFalse(sshping.has_shell(t))
+
+    def test_shell_server_passes_the_shell_check(self):
+        self.server_class = ShellWithoutTerminalServer
+        self.start_server()
+        self.assertTrue(sshping.has_shell(self.connect()))
+
+
+class TestRestrictedAccount(FakeServerTestCase):
 
     def test_full_run(self):
         self.start_server()
@@ -245,21 +345,34 @@ class TestRestrictedAccount(ShelllessTestCase):
         self.assertEqual(results["Download-Size"], "2000000 B")
         self.assertIn("remote account has no shell", err)
         self.assertIn("(-e ignored)", err)
-        self.assertIn("the speed test uses SFTP", err)
-        # The only command run is the shell check, and the temporary file
-        # is gone afterwards
-        self.assertEqual(self.server.exec_commands, ['echo SSHPING_""READY'])
-        self.assertEqual(self.server.exec_output,
-                         [["echo", 'SSHPING_""READY']])
-        self.assertEqual(os.listdir(self.home), [])
+
+        # After the shell check, only allowed commands were run, and the
+        # file went to /tmp and was removed
+        check, *commands = self.server.exec_commands
+        self.assertEqual(check, sshping.SHELL_CHECK)
+        for command in commands:
+            for words in split_commands(command):
+                self.assertIn(words[0], RestrictedServer.ALLOWED, command)
+        self.assertEqual(commands[0], "test -w /tmp")
+        self.assertRegex(commands[1], r"^dd of=/tmp/sshping-[0-9a-f]{16}\.tmp ")
+        self.assertEqual(self.remote_files(), [])
+
+    def test_without_tmp_the_file_goes_in_home(self):
+        os.rmdir(os.path.join(self.root, "tmp"))
+        self.start_server()
+        status, _, err = self.run_sshping("-r", "s", "-s", "1")
+        self.assertEqual(status, 0, err)
+        self.assertRegex(self.server.exec_commands[2],
+                         r"^dd of=sshping-[0-9a-f]{16}\.tmp ")
+        self.assertEqual(self.remote_files(), [])
 
     def test_existing_remote_file_is_kept(self):
         self.start_server()
-        path = os.path.join(self.home, "existing.tmp")
+        path = os.path.join(self.root, "home", "existing.tmp")
         with open(path, "w") as f:
             f.write("old")
-        status, results, err = self.run_sshping("-r", "s", "-s", "1",
-                                                "-z", "existing.tmp")
+        status, _, err = self.run_sshping("-r", "s", "-s", "1",
+                                          "-z", "existing.tmp")
         self.assertEqual(status, 0, err)
         self.assertEqual(os.path.getsize(path), sshping.MEGA)
 
@@ -268,7 +381,14 @@ class TestRestrictedAccount(ShelllessTestCase):
         status, _, err = self.run_sshping("-r", "s", "-s", "1",
                                           "-z", "new.tmp")
         self.assertEqual(status, 0, err)
-        self.assertEqual(os.listdir(self.home), [])
+        self.assertEqual(self.remote_files(), [])
+
+    def test_unwritable_remote_file_fails(self):
+        self.start_server()
+        status, _, err = self.run_sshping("-r", "s", "-s", "1",
+                                          "-z", "/no/such/dir/x.tmp")
+        self.assertEqual(status, sshping.EXIT_TEST_FAILED)
+        self.assertIn("Upload failed", err)
 
     def test_echo_stops_when_terminal_buffer_fills(self):
         self.start_server(echo_limit=40)
@@ -283,34 +403,22 @@ class TestRestrictedAccount(ShelllessTestCase):
         self.assertEqual(status, sshping.EXIT_TEST_FAILED)
         self.assertIn("No echo", err)
 
-    def test_without_sftp_the_speed_test_fails(self):
-        self.start_server(sftp=False)
-        status, results, err = self.run_sshping("-c", "20", "-s", "1")
-        self.assertEqual(status, sshping.EXIT_TEST_FAILED)
-        self.assertEqual(results["Echo-Count"], "20 B")
-        self.assertIn("Cannot start SFTP", err)
-
     def test_wrong_password(self):
         self.start_server()
-        out, err = io.StringIO(), io.StringIO()
-        with mock.patch.dict(os.environ, {"HOME": self.local_home,
-                                          "SSH_AUTH_SOCK": ""}), \
-                contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(err):
-            status = sshping.main(["-p", "wrong",
-                                   f"{USER}@127.0.0.1:{self.ssh.port}"])
+        status, _, err = self.run_sshping(password="wrong")
         self.assertEqual(status, sshping.EXIT_CONNECT_FAILED)
-        self.assertIn("Cannot authenticate", err.getvalue())
+        self.assertIn("Cannot authenticate", err)
 
 
-class TestShellThatNeverAnswers(ShelllessTestCase):
+class TestShellThatNeverAnswers(FakeServerTestCase):
     server_class = ShellWithoutTerminalServer
 
     def test_falls_back_to_terminal_echo(self):
         self.start_server()
-        status, results, err = self.run_sshping("-r", "e", "-c", "50")
+        status, results, err = self.run_sshping("-c", "50", "-s", "1")
         self.assertEqual(status, 0, err)
         self.assertEqual(results["Echo-Count"], "50 B")
+        self.assertEqual(results["Download-Size"], "1000000 B")
         self.assertIn("login shell did not answer", err)
         # The wait for the shell is not part of the login time
         login_ns = int(results["ssh-Login-Time"].split()[0])

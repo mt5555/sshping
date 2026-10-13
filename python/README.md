@@ -26,9 +26,11 @@ terminal driver (the C++ version's default), use:
 
     ./sshping.py -e 'cat > /dev/null' host
 
-The speed test streams `-s` megabytes to a remote file and then reads them
-back, one ssh channel each way. By default the file is a new `mktemp` file in
-`/tmp`, removed afterwards. With `-z FILE` it is removed only if it did not
+The speed test streams `-s` megabytes to a remote file with `dd of=FILE`
+and reads them back with `cat FILE`, one ssh channel each way. These need
+no shell, so they work on restricted accounts too. By default the file gets
+a random name, in `/tmp` if it is writable or else in the home directory,
+and is removed afterwards. With `-z FILE` it is removed only if it did not
 exist before.
 
 Results go to stdout as `Label: value unit` lines. Progress, warnings and
@@ -37,11 +39,13 @@ failed, 2 for usage errors and 255 if the connection or login failed.
 
 ## Accounts without a shell
 
-Some hosts, such as rsync.net, give an account no shell: it may run only
-single commands from a fixed list, plus scp, SFTP and rsync. sshping checks
-for this by running `echo SSHPING_""READY`, since only a real shell removes
-the quotes. Without a shell it prints a warning and works like the C++
-version:
+Some hosts, such as rsync.net, give an account no interactive shell: it may
+run only commands from a fixed list, plus tools like scp, SFTP and rsync.
+sshping checks for this by running `sh -c 'echo SSHPING_$((6*7))'`. Every
+Unix host has `sh`, whatever your login shell, and only a real shell prints
+`SSHPING_42`. Simpler checks don't work: rsync.net's command handler removes
+quotes and obeys `;` just like a shell. Without a shell, sshping prints a
+warning and measures the way the C++ version does:
 
 - `ssh-Login-Time` ends when the terminal session's login output stops,
   rather than when a shell answers.
@@ -49,14 +53,11 @@ version:
   them, so the remote terminal driver echoes them. `-e` is ignored. If the
   terminal's input buffer fills, the test stops early with a warning and
   reports what it measured; use `-c` to send fewer characters.
-- The speed test uses SFTP, with a randomly named file in the SFTP home
-  directory, removed afterwards. A `-z FILE` is removed only if it did not
-  exist before. paramiko's SFTP downloads
-  more slowly than the `cat` stream used on normal hosts, so compare speed
-  results only between hosts tested the same way.
+
+The speed test is the same on every host.
 
 The same fallback applies on a normal host whose interactive login never
-answers within 30 s, but there the speed test still uses `cat`.
+answers within 30 s.
 
 ## Differences from the C++ version
 
@@ -93,5 +94,6 @@ measure paramiko rather than the network.
 
 `test_sshping.py` covers formatting, statistics and option parsing.
 `test_restricted_server.py` runs sshping end to end against fake ssh
-servers built with paramiko, including one that behaves like a restricted
-account (no shell, fixed command list, SFTP).
+servers built with paramiko. One behaves like an rsync.net account as
+observed with a real one: no interactive shell, a fixed command list, and
+quotes and `;` handled like a shell.
