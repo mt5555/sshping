@@ -81,6 +81,12 @@ Download-Size:                8.00 MB
 Download-Rate:                5.48 MB/s
 ```
 
+## Python version
+
+A Python port is in [python/](python/README.md). It needs only Python and
+paramiko, and by default measures echo by a remote process rather than by
+the remote terminal driver.
+
 ## Building
 
 Install the libssh-dev (or libssh-devel) package, version 0.6 or later:
